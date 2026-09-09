@@ -1,29 +1,32 @@
 """
-Beauty Bot — Phase 1.
+Beauty Bot — Phase 1, PostgreSQL version.
 
-Цель этой версии:
-- зарегистрировать пользователя при /start;
-- сохранить Telegram-профиль и источник перехода;
-- сохранить каждое повторное открытие по deep-link;
-- дать разделы «Полка» и «Вишлист»;
-- фиксировать ключевые события воронки;
-- считать активацию;
-- дать администратору /stats и /export.
+Назначение:
+- регистрация пользователя при /start;
+- сохранение Telegram-профиля и источника;
+- сохранение каждого рекламного касания;
+- Полка / Вишлист;
+- события воронки;
+- активация;
+- /stats и /export для администраторов.
 
-Реальный мониторинг цен и отправка уведомлений о скидках в Phase 1 не реализованы.
+Эта версия использует PostgreSQL через DATABASE_URL.
 """
 
 import asyncio
 import csv
-import json
 import logging
 import os
 import re
-import sqlite3
 import tempfile
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
+
+import psycopg
+from psycopg.errors import UniqueViolation
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
@@ -45,7 +48,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-DB_PATH = os.getenv("DB_PATH", "beauty_bot.db").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 ITEMS_THRESHOLD = int(os.getenv("ITEMS_THRESHOLD", "2"))
 
 ADMIN_IDS = {
@@ -55,120 +58,106 @@ ADMIN_IDS = {
 }
 
 router = Router()
-
 SOURCE_RE = re.compile(r"[^A-Za-z0-9_-]+")
 
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def now_utc():
+    return datetime.now(timezone.utc)
 
 
 def normalize_source(raw: str | None) -> str:
-    """Deep-link Telegram допускает A-Z, a-z, 0-9, _ и -, до 64 символов."""
     if not raw:
         return "direct"
     value = SOURCE_RE.sub("_", raw.strip())[:64]
     return value or "direct"
 
 
-def connect_db() -> sqlite3.Connection:
-    path = Path(DB_PATH)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+def connect_db():
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "Не задан DATABASE_URL. В Railway добавь Reference Variable "
+            "из Postgres service."
+        )
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
 
 def init_db() -> None:
-    conn = connect_db()
-    conn.executescript(
+    statements = [
         """
         CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
+            user_id BIGINT PRIMARY KEY,
             username TEXT,
             first_name TEXT,
             last_name TEXT,
             language_code TEXT,
-            is_premium INTEGER DEFAULT 0,
+            is_premium BOOLEAN NOT NULL DEFAULT FALSE,
 
             first_source TEXT NOT NULL DEFAULT 'direct',
             last_source TEXT NOT NULL DEFAULT 'direct',
 
-            started_at TEXT NOT NULL,
-            last_started_at TEXT NOT NULL,
+            started_at TIMESTAMPTZ NOT NULL,
+            last_started_at TIMESTAMPTZ NOT NULL,
 
-            notifications INTEGER NOT NULL DEFAULT 0,
-            activated_at TEXT
-        );
-
+            notifications BOOLEAN NOT NULL DEFAULT FALSE,
+            activated_at TIMESTAMPTZ
+        )
+        """,
+        """
         CREATE TABLE IF NOT EXISTS starts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
             source TEXT NOT NULL,
-            started_at TEXT NOT NULL,
-            FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
-        );
-
+            started_at TIMESTAMPTZ NOT NULL
+        )
+        """,
+        """
         CREATE TABLE IF NOT EXISTS items (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
             section TEXT NOT NULL CHECK(section IN ('polka', 'wishlist')),
             name TEXT NOT NULL,
             normalized_name TEXT NOT NULL,
-            added_at TEXT NOT NULL,
-            UNIQUE(user_id, section, normalized_name),
-            FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
-        );
-
-        CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            event_name TEXT NOT NULL,
-            event_data TEXT,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_starts_user_id
-            ON starts(user_id);
-
-        CREATE INDEX IF NOT EXISTS idx_starts_source
-            ON starts(source);
-
-        CREATE INDEX IF NOT EXISTS idx_items_user_section
-            ON items(user_id, section);
-
-        CREATE INDEX IF NOT EXISTS idx_events_user_id
-            ON events(user_id);
-
-        CREATE INDEX IF NOT EXISTS idx_events_name
-            ON events(event_name);
+            added_at TIMESTAMPTZ NOT NULL,
+            UNIQUE(user_id, section, normalized_name)
+        )
+        """,
         """
-    )
-    conn.commit()
-    conn.close()
+        CREATE TABLE IF NOT EXISTS events (
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+            event_name TEXT NOT NULL,
+            event_data JSONB,
+            created_at TIMESTAMPTZ NOT NULL
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_starts_user_id ON starts(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_starts_source ON starts(source)",
+        "CREATE INDEX IF NOT EXISTS idx_items_user_section ON items(user_id, section)",
+        "CREATE INDEX IF NOT EXISTS idx_events_user_id ON events(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_events_name ON events(event_name)",
+    ]
+
+    with connect_db() as conn:
+        with conn.cursor() as cur:
+            for statement in statements:
+                cur.execute(statement)
 
 
 def log_event(user_id: int, event_name: str, data: dict | None = None) -> None:
-    conn = connect_db()
-    conn.execute(
-        """
-        INSERT INTO events (user_id, event_name, event_data, created_at)
-        VALUES (?, ?, ?, ?)
-        """,
-        (
-            user_id,
-            event_name,
-            json.dumps(data, ensure_ascii=False) if data else None,
-            now_iso(),
-        ),
-    )
-    conn.commit()
-    conn.close()
+    with connect_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO events (user_id, event_name, event_data, created_at)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (
+                    user_id,
+                    event_name,
+                    Jsonb(data) if data is not None else None,
+                    now_utc(),
+                ),
+            )
 
 
 def register_start(message: Message, source: str) -> None:
@@ -176,101 +165,83 @@ def register_start(message: Message, source: str) -> None:
     if user is None:
         return
 
-    timestamp = now_iso()
-    conn = connect_db()
+    timestamp = now_utc()
 
-    existing = conn.execute(
-        "SELECT user_id FROM users WHERE user_id = ?",
-        (user.id,),
-    ).fetchone()
-
-    if existing is None:
-        conn.execute(
-            """
-            INSERT INTO users (
-                user_id, username, first_name, last_name, language_code,
-                is_premium, first_source, last_source,
-                started_at, last_started_at, notifications
+    with connect_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT user_id FROM users WHERE user_id = %s",
+                (user.id,),
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-            """,
-            (
-                user.id,
-                user.username,
-                user.first_name,
-                user.last_name,
-                user.language_code,
-                int(bool(getattr(user, "is_premium", False))),
-                source,
-                source,
-                timestamp,
-                timestamp,
-            ),
-        )
-    else:
-        conn.execute(
-            """
-            UPDATE users
-            SET username = ?,
-                first_name = ?,
-                last_name = ?,
-                language_code = ?,
-                is_premium = ?,
-                last_source = ?,
-                last_started_at = ?
-            WHERE user_id = ?
-            """,
-            (
-                user.username,
-                user.first_name,
-                user.last_name,
-                user.language_code,
-                int(bool(getattr(user, "is_premium", False))),
-                source,
-                timestamp,
-                user.id,
-            ),
-        )
+            existing = cur.fetchone()
 
-    conn.execute(
-        """
-        INSERT INTO starts (user_id, source, started_at)
-        VALUES (?, ?, ?)
-        """,
-        (user.id, source, timestamp),
-    )
+            if existing is None:
+                cur.execute(
+                    """
+                    INSERT INTO users (
+                        user_id, username, first_name, last_name, language_code,
+                        is_premium, first_source, last_source,
+                        started_at, last_started_at, notifications
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE)
+                    """,
+                    (
+                        user.id,
+                        user.username,
+                        user.first_name,
+                        user.last_name,
+                        user.language_code,
+                        bool(getattr(user, "is_premium", False)),
+                        source,
+                        source,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE users
+                    SET username = %s,
+                        first_name = %s,
+                        last_name = %s,
+                        language_code = %s,
+                        is_premium = %s,
+                        last_source = %s,
+                        last_started_at = %s
+                    WHERE user_id = %s
+                    """,
+                    (
+                        user.username,
+                        user.first_name,
+                        user.last_name,
+                        user.language_code,
+                        bool(getattr(user, "is_premium", False)),
+                        source,
+                        timestamp,
+                        user.id,
+                    ),
+                )
 
-    conn.execute(
-        """
-        INSERT INTO events (user_id, event_name, event_data, created_at)
-        VALUES (?, 'start', ?, ?)
-        """,
-        (
-            user.id,
-            json.dumps({"source": source}, ensure_ascii=False),
-            timestamp,
-        ),
-    )
+            cur.execute(
+                """
+                INSERT INTO starts (user_id, source, started_at)
+                VALUES (%s, %s, %s)
+                """,
+                (user.id, source, timestamp),
+            )
 
-    conn.commit()
-    conn.close()
-
-
-def ensure_user_exists(message: Message) -> None:
-    """Страховка для старых сообщений/кнопок после обновления бота."""
-    user = message.from_user
-    if user is None:
-        return
-
-    conn = connect_db()
-    row = conn.execute(
-        "SELECT user_id FROM users WHERE user_id = ?",
-        (user.id,),
-    ).fetchone()
-    conn.close()
-
-    if row is None:
-        register_start(message, "direct")
+            cur.execute(
+                """
+                INSERT INTO events (user_id, event_name, event_data, created_at)
+                VALUES (%s, 'start', %s, %s)
+                """,
+                (
+                    user.id,
+                    Jsonb({"source": source}),
+                    timestamp,
+                ),
+            )
 
 
 def normalize_item_name(name: str) -> str:
@@ -278,25 +249,24 @@ def normalize_item_name(name: str) -> str:
 
 
 def add_item(user_id: int, section: str, name: str) -> bool:
-    """Возвращает True, если товар добавлен, False — если это дубликат."""
     cleaned = " ".join(name.split())
     normalized = normalize_item_name(cleaned)
 
-    conn = connect_db()
     try:
-        conn.execute(
-            """
-            INSERT INTO items (user_id, section, name, normalized_name, added_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (user_id, section, cleaned, normalized, now_iso()),
-        )
-        conn.commit()
+        with connect_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO items (
+                        user_id, section, name, normalized_name, added_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (user_id, section, cleaned, normalized, now_utc()),
+                )
         added = True
-    except sqlite3.IntegrityError:
+    except UniqueViolation:
         added = False
-    finally:
-        conn.close()
 
     if added:
         log_event(
@@ -310,13 +280,12 @@ def add_item(user_id: int, section: str, name: str) -> bool:
 
 
 def set_notifications(user_id: int, value: bool) -> None:
-    conn = connect_db()
-    conn.execute(
-        "UPDATE users SET notifications = ? WHERE user_id = ?",
-        (int(value), user_id),
-    )
-    conn.commit()
-    conn.close()
+    with connect_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET notifications = %s WHERE user_id = %s",
+                (value, user_id),
+            )
 
     log_event(
         user_id,
@@ -328,86 +297,94 @@ def set_notifications(user_id: int, value: bool) -> None:
 
 
 def maybe_activate(user_id: int) -> bool:
-    """
-    Активация = минимум ITEMS_THRESHOLD уникальных товаров
-    + включены уведомления.
-    """
-    conn = connect_db()
+    with connect_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(DISTINCT normalized_name) AS items_count
+                FROM items
+                WHERE user_id = %s
+                """,
+                (user_id,),
+            )
+            items_count = cur.fetchone()["items_count"]
 
-    items_count = conn.execute(
-        """
-        SELECT COUNT(DISTINCT normalized_name)
-        FROM items
-        WHERE user_id = ?
-        """,
-        (user_id,),
-    ).fetchone()[0]
+            cur.execute(
+                """
+                SELECT notifications, activated_at
+                FROM users
+                WHERE user_id = %s
+                """,
+                (user_id,),
+            )
+            user = cur.fetchone()
 
-    user = conn.execute(
-        """
-        SELECT notifications, activated_at
-        FROM users
-        WHERE user_id = ?
-        """,
-        (user_id,),
-    ).fetchone()
+            if (
+                user is not None
+                and user["activated_at"] is None
+                and user["notifications"] is True
+                and items_count >= ITEMS_THRESHOLD
+            ):
+                timestamp = now_utc()
 
-    activated_now = False
+                cur.execute(
+                    """
+                    UPDATE users
+                    SET activated_at = %s
+                    WHERE user_id = %s
+                    """,
+                    (timestamp, user_id),
+                )
 
-    if (
-        user is not None
-        and user["activated_at"] is None
-        and user["notifications"] == 1
-        and items_count >= ITEMS_THRESHOLD
-    ):
-        timestamp = now_iso()
-        conn.execute(
-            "UPDATE users SET activated_at = ? WHERE user_id = ?",
-            (timestamp, user_id),
-        )
-        conn.execute(
-            """
-            INSERT INTO events (user_id, event_name, event_data, created_at)
-            VALUES (?, 'activated', ?, ?)
-            """,
-            (
-                user_id,
-                json.dumps(
-                    {"items_count": items_count, "threshold": ITEMS_THRESHOLD},
-                    ensure_ascii=False,
-                ),
-                timestamp,
-            ),
-        )
-        conn.commit()
-        activated_now = True
+                cur.execute(
+                    """
+                    INSERT INTO events (
+                        user_id, event_name, event_data, created_at
+                    )
+                    VALUES (%s, 'activated', %s, %s)
+                    """,
+                    (
+                        user_id,
+                        Jsonb(
+                            {
+                                "items_count": items_count,
+                                "threshold": ITEMS_THRESHOLD,
+                            }
+                        ),
+                        timestamp,
+                    ),
+                )
+                return True
 
-    conn.close()
-    return activated_now
+    return False
 
 
 def get_items(user_id: int, section: str) -> list[str]:
-    conn = connect_db()
-    rows = conn.execute(
-        """
-        SELECT name
-        FROM items
-        WHERE user_id = ? AND section = ?
-        ORDER BY id
-        """,
-        (user_id, section),
-    ).fetchall()
-    conn.close()
+    with connect_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT name
+                FROM items
+                WHERE user_id = %s AND section = %s
+                ORDER BY id
+                """,
+                (user_id, section),
+            )
+            rows = cur.fetchall()
+
     return [row["name"] for row in rows]
 
 
 def get_notifications(user_id: int) -> bool:
-    conn = connect_db()
-    row = conn.execute(
-        "SELECT notifications FROM users WHERE user_id = ?",
-        (user_id,),
-    ).fetchone()
-    conn.close()
+    with connect_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT notifications FROM users WHERE user_id = %s",
+                (user_id,),
+            )
+            row = cur.fetchone()
+
     return bool(row and row["notifications"])
 
 
@@ -416,33 +393,49 @@ def is_admin(user_id: int) -> bool:
 
 
 def build_stats_text() -> str:
-    conn = connect_db()
+    with connect_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM users")
+            total_users = cur.fetchone()["n"]
 
-    total_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    activated = conn.execute(
-        "SELECT COUNT(*) FROM users WHERE activated_at IS NOT NULL"
-    ).fetchone()[0]
-    notifications = conn.execute(
-        "SELECT COUNT(*) FROM users WHERE notifications = 1"
-    ).fetchone()[0]
-    with_items = conn.execute(
-        "SELECT COUNT(DISTINCT user_id) FROM items"
-    ).fetchone()[0]
+            cur.execute(
+                """
+                SELECT COUNT(*) AS n
+                FROM users
+                WHERE activated_at IS NOT NULL
+                """
+            )
+            activated = cur.fetchone()["n"]
 
-    sources = conn.execute(
-        """
-        SELECT
-            u.first_source AS source,
-            COUNT(*) AS registrations,
-            SUM(CASE WHEN u.activated_at IS NOT NULL THEN 1 ELSE 0 END) AS activated
-        FROM users u
-        GROUP BY u.first_source
-        ORDER BY registrations DESC
-        LIMIT 20
-        """
-    ).fetchall()
+            cur.execute(
+                """
+                SELECT COUNT(*) AS n
+                FROM users
+                WHERE notifications = TRUE
+                """
+            )
+            notifications = cur.fetchone()["n"]
 
-    conn.close()
+            cur.execute(
+                "SELECT COUNT(DISTINCT user_id) AS n FROM items"
+            )
+            with_items = cur.fetchone()["n"]
+
+            cur.execute(
+                """
+                SELECT
+                    first_source AS source,
+                    COUNT(*) AS registrations,
+                    COUNT(*) FILTER (
+                        WHERE activated_at IS NOT NULL
+                    ) AS activated
+                FROM users
+                GROUP BY first_source
+                ORDER BY registrations DESC
+                LIMIT 20
+                """
+            )
+            sources = cur.fetchall()
 
     conv = (activated / total_users * 100) if total_users else 0.0
 
@@ -476,29 +469,31 @@ def build_stats_text() -> str:
 
 
 def export_database_to_zip() -> Path:
-    """Экспортирует основные таблицы в CSV и собирает их в ZIP."""
-    conn = connect_db()
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     temp_dir = Path(tempfile.mkdtemp(prefix="beauty_bot_export_"))
     zip_path = temp_dir / f"beauty_bot_export_{timestamp}.zip"
-
     tables = ["users", "starts", "items", "events"]
 
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for table in tables:
-            cursor = conn.execute(f"SELECT * FROM {table} ORDER BY 1")
-            rows = cursor.fetchall()
-            columns = [desc[0] for desc in cursor.description]
+    with connect_db() as conn:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for table in tables:
+                with conn.cursor() as cur:
+                    cur.execute(f"SELECT * FROM {table} ORDER BY 1")
+                    rows = cur.fetchall()
+                    columns = [col.name for col in cur.description]
 
-            csv_path = temp_dir / f"{table}.csv"
-            with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
-                writer = csv.writer(f)
-                writer.writerow(columns)
-                writer.writerows([tuple(row) for row in rows])
+                csv_path = temp_dir / f"{table}.csv"
+                with csv_path.open(
+                    "w", newline="", encoding="utf-8-sig"
+                ) as f:
+                    writer = csv.writer(f)
+                    writer.writerow(columns)
+                    writer.writerows(
+                        [[row[column] for column in columns] for row in rows]
+                    )
 
-            zf.write(csv_path, arcname=csv_path.name)
+                zf.write(csv_path, arcname=csv_path.name)
 
-    conn.close()
     return zip_path
 
 
@@ -518,8 +513,18 @@ def main_menu(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📦 Полка", callback_data="menu_polka")],
-            [InlineKeyboardButton(text="✨ Вишлист", callback_data="menu_wishlist")],
-            [InlineKeyboardButton(text=notif_label, callback_data="toggle_notify")],
+            [
+                InlineKeyboardButton(
+                    text="✨ Вишлист",
+                    callback_data="menu_wishlist",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=notif_label,
+                    callback_data="toggle_notify",
+                )
+            ],
         ]
     )
 
@@ -555,17 +560,15 @@ async def cmd_start(message: Message):
 
 @router.message(Command("id"))
 async def cmd_id(message: Message):
-    await message.answer(
-        f"Твой Telegram ID: {message.from_user.id}"
-    )
+    await message.answer(f"Твой Telegram ID: {message.from_user.id}")
 
 
 @router.message(Command("privacy"))
 async def cmd_privacy(message: Message):
     await message.answer(
-        "Для работы тестовой версии бот сохраняет Telegram ID, доступные Telegram "
-        "данные профиля (например, username и имя), источник перехода, действия "
-        "внутри бота, добавленные названия товаров и настройку уведомлений. "
+        "Для работы тестовой версии бот сохраняет Telegram ID, доступные "
+        "Telegram данные профиля, источник перехода, действия внутри бота, "
+        "добавленные названия товаров и настройку уведомлений. "
         "Телефон и email автоматически не запрашиваются."
     )
 
@@ -711,10 +714,11 @@ async def add_polka_finish(message: Message, state: FSMContext):
     added = add_item(message.from_user.id, "polka", name)
     await state.clear()
 
-    if added:
-        text = f"Добавила «{name}» на полку ✅"
-    else:
-        text = f"«{name}» уже есть на твоей полке."
+    text = (
+        f"Добавила «{name}» на полку ✅"
+        if added
+        else f"«{name}» уже есть на твоей полке."
+    )
 
     await message.answer(
         text,
@@ -731,10 +735,11 @@ async def add_wishlist_finish(message: Message, state: FSMContext):
     added = add_item(message.from_user.id, "wishlist", name)
     await state.clear()
 
-    if added:
-        text = f"Добавила «{name}» в вишлист ✅"
-    else:
-        text = f"«{name}» уже есть в твоём вишлисте."
+    text = (
+        f"Добавила «{name}» в вишлист ✅"
+        if added
+        else f"«{name}» уже есть в твоём вишлисте."
+    )
 
     await message.answer(
         text,
@@ -760,8 +765,12 @@ async def toggle_notify(callback: CallbackQuery):
 
 async def main():
     if not BOT_TOKEN:
+        raise SystemExit("Не задан BOT_TOKEN.")
+
+    if not DATABASE_URL:
         raise SystemExit(
-            "Не задан BOT_TOKEN. Создай .env по образцу .env.example."
+            "Не задан DATABASE_URL. В Railway свяжи сервис бота "
+            "с Postgres через Reference Variable."
         )
 
     init_db()
@@ -770,7 +779,7 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    logger.info("Beauty Bot Phase 1 запущен")
+    logger.info("Beauty Bot Phase 1 + PostgreSQL запущен")
     await dp.start_polling(bot)
 
 
