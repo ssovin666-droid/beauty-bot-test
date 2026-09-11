@@ -615,8 +615,10 @@ async def cmd_start(message: Message):
         logger.warning("User %s blocked the bot", message.from_user.id)
         return
 
-    if click and click.get("yclid"):
-        asyncio.create_task(send_metrika_conversion(click))
+    # Диагностика Метрики запускается для КАЖДОГО Start.
+    # Если это рекламный переход с yclid — будет SEND_ATTEMPT / SUCCESS / FAILED.
+    # Если yclid нет — будет понятный SKIP с причиной.
+    asyncio.create_task(send_metrika_conversion(click))
 
 
 @router.message(Command("id"))
